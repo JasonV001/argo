@@ -1,8 +1,8 @@
 #!/bin/bash
 #==========================================================================
 # Reality + Hysteria2 安全部署脚本 (Sing-Box 内核)
-# 功能: 交互式生成、修改配置、端口跳跃、混淆
-# 版本: 1.0.0
+# 功能: 交互式生成、修改配置、端口跳跃、混淆、保活
+# 版本: 2.0.0
 #==========================================================================
 
 set -e
@@ -88,19 +88,7 @@ gen_short_id() {
 
 gen_reality_keypair() {
     if command -v sing-box &>/dev/null; then
-        sing-box generate reality-keypair
-    else
-        # 临时下载 sing-box 来生成密钥对
-        local tmp_bin="/tmp/sing-box-tmp"
-        if [[ ! -f "$tmp_bin" ]]; then
-            curl -sL "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-1.11.0-linux-amd64.tar.gz" | \
-                tar -xz -C /tmp sing-box-1.11.0-linux-amd64/sing-box --strip-components=1 2>/dev/null
-            mv /tmp/sing-box "$tmp_bin" 2>/dev/null
-        fi
-        if [[ -f "$tmp_bin" ]]; then
-            chmod +x "$tmp_bin"
-            "$tmp_bin" generate reality-keypair 2>/dev/null
-        fi
+        sing-box generate reality-keypair 2>/dev/null
     fi
 }
 
@@ -108,10 +96,6 @@ gen_reality_keypair() {
 load_vars() {
     if [[ -f "$VARS_FILE" ]]; then
         source "$VARS_FILE"
-        # 将保存的变量加载到数组
-        VARS[TCP_KEEPALIVE_INTERVAL]="${TCP_KEEPALIVE_INTERVAL:-30}"
-        VARS[HY2_HEARTBEAT]="${HY2_HEARTBEAT:-10s}"
-        VARS[HY2_IDLE_TIMEOUT]="${HY2_IDLE_TIMEOUT:-0}"
         VARS[REALITY_UUID]="${REALITY_UUID:-}"
         VARS[REALITY_PORT]="${REALITY_PORT:-}"
         VARS[REALITY_SERVER_NAME]="${REALITY_SERVER_NAME:-}"
@@ -125,14 +109,16 @@ load_vars() {
         VARS[HY2_HOP_END]="${HY2_HOP_END:-}"
         VARS[HY2_OBFS_PASSWORD]="${HY2_OBFS_PASSWORD:-}"
         VARS[SNI]="${SNI:-}"
+        VARS[TCP_KEEPALIVE_INTERVAL]="${TCP_KEEPALIVE_INTERVAL:-30}"
+        VARS[HY2_HEARTBEAT]="${HY2_HEARTBEAT:-10s}"
+        VARS[HY2_IDLE_TIMEOUT]="${HY2_IDLE_TIMEOUT:-0}"
+        VARS[HY2_MIN_HOP_INTERVAL]="${HY2_MIN_HOP_INTERVAL:-10s}"
+        VARS[HY2_MAX_HOP_INTERVAL]="${HY2_MAX_HOP_INTERVAL:-60s}"
     fi
 }
 
 #--------------------------- 保存变量 ---------------------------#
 save_vars() {
-TCP_KEEPALIVE_INTERVAL="${VARS[TCP_KEEPALIVE_INTERVAL]}"
-HY2_HEARTBEAT="${VARS[HY2_HEARTBEAT]}"
-HY2_IDLE_TIMEOUT="${VARS[HY2_IDLE_TIMEOUT]}"
     cat > "$VARS_FILE" << EOF
 REALITY_UUID="${VARS[REALITY_UUID]}"
 REALITY_PORT="${VARS[REALITY_PORT]}"
@@ -147,6 +133,11 @@ HY2_HOP_START="${VARS[HY2_HOP_START]}"
 HY2_HOP_END="${VARS[HY2_HOP_END]}"
 HY2_OBFS_PASSWORD="${VARS[HY2_OBFS_PASSWORD]}"
 SNI="${VARS[SNI]}"
+TCP_KEEPALIVE_INTERVAL="${VARS[TCP_KEEPALIVE_INTERVAL]}"
+HY2_HEARTBEAT="${VARS[HY2_HEARTBEAT]}"
+HY2_IDLE_TIMEOUT="${VARS[HY2_IDLE_TIMEOUT]}"
+HY2_MIN_HOP_INTERVAL="${VARS[HY2_MIN_HOP_INTERVAL]}"
+HY2_MAX_HOP_INTERVAL="${VARS[HY2_MAX_HOP_INTERVAL]}"
 EOF
     chmod 600 "$VARS_FILE"
 }
@@ -178,7 +169,7 @@ validate_port_range() {
         return 1
     fi
     if [[ $((end - start)) -lt 10 ]]; then
-        return 2  # 范围太小
+        return 2
     fi
     return 0
 }
@@ -198,12 +189,10 @@ install_singbox() {
     fi
     
     log INFO "开始安装 Sing-Box..."
-    # 使用官方安装脚本
     if curl -fsSL https://sing-box.app/gpg.key | gpg --dearmor -o /etc/apt/keyrings/sing-box.gpg 2>/dev/null; then
         echo "deb [signed-by=/etc/apt/keyrings/sing-box.gpg] https://sing-box.app/debian stable main" > /etc/apt/sources.list.d/sing-box.list
         apt-get update -qq && apt-get install -y sing-box >> "$LOG_FILE" 2>&1
     else
-        # 备用: 直接下载二进制
         local arch
         arch=$(uname -m)
         case $arch in
@@ -228,7 +217,6 @@ configure_reality() {
     echo ""
     echo -e "${CYAN}========== Reality 配置 ==========${NC}"
     
-    # UUID
     if [[ -n "${VARS[REALITY_UUID]}" ]]; then
         echo -e "当前 UUID: ${GREEN}${VARS[REALITY_UUID]}${NC}"
         read -p "是否修改? [y/N]: " -r
@@ -241,7 +229,6 @@ configure_reality() {
         VARS[REALITY_UUID]="${input_uuid:-$(gen_uuid)}"
     fi
     
-    # 端口
     if [[ -n "${VARS[REALITY_PORT]}" ]]; then
         echo -e "当前端口: ${GREEN}${VARS[REALITY_PORT]}${NC}"
         read -p "是否修改? [y/N]: " -r
@@ -270,7 +257,6 @@ configure_reality() {
         done
     fi
     
-    # 回落域名
     if [[ -n "${VARS[REALITY_DEST]}" ]]; then
         echo -e "当前回落域名: ${GREEN}${VARS[REALITY_DEST]}${NC}"
         read -p "是否修改? [y/N]: " -r
@@ -283,7 +269,6 @@ configure_reality() {
         VARS[REALITY_DEST]="${input_dest:-www.microsoft.com}"
     fi
     
-    # 服务器名
     if [[ -n "${VARS[REALITY_SERVER_NAME]}" ]]; then
         echo -e "当前 serverName: ${GREEN}${VARS[REALITY_SERVER_NAME]}${NC}"
         read -p "是否修改? [y/N]: " -r
@@ -296,7 +281,6 @@ configure_reality() {
         VARS[REALITY_SERVER_NAME]="${input_sn:-${VARS[REALITY_DEST]}}"
     fi
     
-    # 生成/读取密钥对
     if [[ -z "${VARS[REALITY_PRIVATE_KEY]}" ]] || [[ -z "${VARS[REALITY_PUBLIC_KEY]}" ]]; then
         echo "正在生成 Reality 密钥对..."
         local keypair
@@ -306,12 +290,11 @@ configure_reality() {
             VARS[REALITY_PUBLIC_KEY]=$(echo "$keypair" | grep "PublicKey" | awk '{print $2}')
             log INFO "密钥对生成成功"
         else
-            log ERROR "密钥对生成失败"
+            log ERROR "密钥对生成失败，请确认 sing-box 已正确安装"
             return 1
         fi
     fi
     
-    # Short ID
     if [[ -z "${VARS[REALITY_SHORT_ID]}" ]]; then
         VARS[REALITY_SHORT_ID]=$(gen_short_id)
         echo -e "已生成 Short ID: ${GREEN}${VARS[REALITY_SHORT_ID]}${NC}"
@@ -326,9 +309,8 @@ configure_hysteria2() {
     echo ""
     echo -e "${CYAN}========== Hysteria2 配置 ==========${NC}"
     
-    # 密码
     if [[ -n "${VARS[HY2_PASSWORD]}" ]]; then
-        echo -e "当前密码: ${GREEN}${VARS[HY2_PASSWORD]${NC}"
+        echo -e "当前密码: ${GREEN}${VARS[HY2_PASSWORD]}${NC}"
         read -p "是否修改? [y/N]: " -r
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             read -p "请输入新密码 (回车自动生成): " input_pw
@@ -339,7 +321,6 @@ configure_hysteria2() {
         VARS[HY2_PASSWORD]="${input_pw:-$(gen_password)}"
     fi
     
-    # 端口
     if [[ -n "${VARS[HY2_PORT]}" ]]; then
         echo -e "当前端口: ${GREEN}${VARS[HY2_PORT]}${NC}"
         read -p "是否修改? [y/N]: " -r
@@ -368,10 +349,9 @@ configure_hysteria2() {
         done
     fi
     
-    # 端口跳跃范围
     echo ""
-    echo -e "${YELLOW}端口跳跃说明: 服务器会在指定范围内随机切换端口"
-    echo -e "建议范围: 30000-50000 (至少10个端口)${NC}"
+    echo -e "${YELLOW}端口跳跃说明: 服务器会在指定范围内随机切换端口${NC}"
+    echo -e "${YELLOW}建议范围: 30000-50000 (至少10个端口)${NC}"
     
     if [[ -n "${VARS[HY2_HOP_START]}" ]] && [[ -n "${VARS[HY2_HOP_END]}" ]]; then
         echo -e "当前跳跃范围: ${GREEN}${VARS[HY2_HOP_START]}-${VARS[HY2_HOP_END]}${NC}"
@@ -383,7 +363,25 @@ configure_hysteria2() {
         configure_hop_ports
     fi
     
-    # 混淆密码
+    echo ""
+    echo -e "${YELLOW}跳跃间隔说明: 设置随机范围后，客户端会在此范围内随机选择切换时间${NC}"
+    
+    if [[ -n "${VARS[HY2_MIN_HOP_INTERVAL]}" ]]; then
+        echo -e "当前最小/最大跳跃间隔: ${GREEN}${VARS[HY2_MIN_HOP_INTERVAL]} / ${VARS[HY2_MAX_HOP_INTERVAL]}${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "最小跳跃间隔 (默认10s, 最低5s): " input_min
+            VARS[HY2_MIN_HOP_INTERVAL]="${input_min:-10s}"
+            read -p "最大跳跃间隔 (默认60s): " input_max
+            VARS[HY2_MAX_HOP_INTERVAL]="${input_max:-60s}"
+        fi
+    else
+        read -p "最小跳跃间隔 (默认10s, 最低5s): " input_min
+        VARS[HY2_MIN_HOP_INTERVAL]="${input_min:-10s}"
+        read -p "最大跳跃间隔 (默认60s): " input_max
+        VARS[HY2_MAX_HOP_INTERVAL]="${input_max:-60s}"
+    fi
+    
     if [[ -n "${VARS[HY2_OBFS_PASSWORD]}" ]]; then
         echo -e "当前混淆密码: ${GREEN}${VARS[HY2_OBFS_PASSWORD]}${NC}"
         read -p "是否修改? [y/N]: " -r
@@ -396,7 +394,6 @@ configure_hysteria2() {
         VARS[HY2_OBFS_PASSWORD]="${input_obfs:-$(gen_password)}"
     fi
     
-    # SNI
     if [[ -z "${VARS[SNI]}" ]]; then
         VARS[SNI]="www.bing.com"
     fi
@@ -432,14 +429,61 @@ configure_hop_ports() {
     done
 }
 
+#--------------------------- 配置保活参数 ---------------------------#
+configure_keepalive() {
+    log INFO "配置保活参数..."
+    
+    echo ""
+    echo -e "${CYAN}========== 保活配置 ==========${NC}"
+    echo -e "${YELLOW}保活功能可防止长时间无流量时连接被运营商/QoS中断${NC}"
+    echo ""
+    
+    if [[ -z "${VARS[TCP_KEEPALIVE_INTERVAL]}" ]]; then
+        read -p "TCP 保活间隔(秒, 默认30): " input_interval
+        VARS[TCP_KEEPALIVE_INTERVAL]="${input_interval:-30}"
+    else
+        echo -e "当前 TCP 保活间隔: ${GREEN}${VARS[TCP_KEEPALIVE_INTERVAL]}秒${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "TCP 保活间隔(秒, 默认30): " input_interval
+            VARS[TCP_KEEPALIVE_INTERVAL]="${input_interval:-30}"
+        fi
+    fi
+    
+    if [[ -z "${VARS[HY2_HEARTBEAT]}" ]]; then
+        read -p "Hysteria2 心跳间隔(默认10s): " input_hb
+        VARS[HY2_HEARTBEAT]="${input_hb:-10s}"
+    else
+        echo -e "当前 Hysteria2 心跳间隔: ${GREEN}${VARS[HY2_HEARTBEAT]}${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "Hysteria2 心跳间隔(默认10s): " input_hb
+            VARS[HY2_HEARTBEAT]="${input_hb:-10s}"
+        fi
+    fi
+    
+    if [[ -z "${VARS[HY2_IDLE_TIMEOUT]}" ]]; then
+        read -p "Hysteria2 空闲超时(秒, 0=不超时, 默认0): " input_idle
+        VARS[HY2_IDLE_TIMEOUT]="${input_idle:-0}"
+    else
+        echo -e "当前 Hysteria2 空闲超时: ${GREEN}${VARS[HY2_IDLE_TIMEOUT]}秒${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "Hysteria2 空闲超时(秒, 0=不超时, 默认0): " input_idle
+            VARS[HY2_IDLE_TIMEOUT]="${input_idle:-0}"
+        fi
+    fi
+    
+    save_vars
+    echo -e "${GREEN}✓ 保活配置完成${NC}"
+}
+
 #--------------------------- 备份配置 ---------------------------#
 backup_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         local backup_name="config_$(date +%Y%m%d_%H%M%S).json"
         cp "$CONFIG_FILE" "${BACKUP_DIR}/${backup_name}"
         log INFO "配置已备份: ${backup_name}"
-        
-        # 只保留最近5个备份
         ls -t "${BACKUP_DIR}"/config_*.json 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null
     fi
 }
@@ -449,9 +493,6 @@ generate_singbox_config() {
     log INFO "生成 Sing-Box 配置..."
     backup_config
     
-    local server_ip
-    server_ip=$(get_server_ip)
-    
     cat > "$CONFIG_FILE" << EOF
 {
   "log": {
@@ -460,68 +501,68 @@ generate_singbox_config() {
   },
   "inbounds": [
     {
-  "type": "vless",
-  "tag": "vless-in",
-  "listen": "::",
-  "listen_port": ${VARS[REALITY_PORT]},
-  "sniff": true,
-  "sniff_override_destination": false,
-  "users": [
-    {
-      "uuid": "${VARS[REALITY_UUID]}",
-      "flow": ""
-    }
-  ],
-  "tls": {
-    "enabled": true,
-    "server_name": "${VARS[REALITY_SERVER_NAME]}",
-    "reality": {
-      "enabled": true,
-      "handshake": {
-        "server": "${VARS[REALITY_DEST]}",
-        "server_port": 443
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": ${VARS[REALITY_PORT]},
+      "sniff": true,
+      "sniff_override_destination": false,
+      "users": [
+        {
+          "uuid": "${VARS[REALITY_UUID]}",
+          "flow": ""
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${VARS[REALITY_SERVER_NAME]}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${VARS[REALITY_DEST]}",
+            "server_port": 443
+          },
+          "private_key": "${VARS[REALITY_PRIVATE_KEY]}",
+          "short_id": ["${VARS[REALITY_SHORT_ID]}"]
+        }
       },
-      "private_key": "${VARS[REALITY_PRIVATE_KEY]}",
-      "short_id": ["${VARS[REALITY_SHORT_ID]}"]
-    }
-  },
-  "transport": {
-    "type": "tcp",
-    "tcp": {
-      "keepalive_interval": ${VARS[TCP_KEEPALIVE_INTERVAL]}
-    }
-  }
-},
+      "transport": {
+        "type": "tcp",
+        "tcp": {
+          "keepalive_interval": ${VARS[TCP_KEEPALIVE_INTERVAL]}
+        }
+      }
+    },
     {
-  "type": "hysteria2",
-  "tag": "hy2-in",
-  "listen": "::",
-  "listen_port": ${VARS[HY2_PORT]},
-  "sniff": true,
-  "sniff_override_destination": false,
-  "up_mbps": 1000,
-  "down_mbps": 1000,
-  "idle_timeout": "${VARS[HY2_IDLE_TIMEOUT]}s",
-  "heartbeat": "${VARS[HY2_HEARTBEAT]}",
-  "users": [
-    {
-      "password": "${VARS[HY2_PASSWORD]}"
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": ${VARS[HY2_PORT]},
+      "sniff": true,
+      "sniff_override_destination": false,
+      "up_mbps": 1000,
+      "down_mbps": 1000,
+      "idle_timeout": "${VARS[HY2_IDLE_TIMEOUT]}s",
+      "heartbeat": "${VARS[HY2_HEARTBEAT]}",
+      "users": [
+        {
+          "password": "${VARS[HY2_PASSWORD]}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${VARS[SNI]}",
+        "alpn": ["h3"],
+        "min_version": "1.2",
+        "max_version": "1.3",
+        "cipher_suites": "TLS_CHACHA20_POLY1305_SHA256"
+      },
+      "masquerade": "https://${VARS[SNI]}",
+      "obfs": {
+        "type": "salamander",
+        "password": "${VARS[HY2_OBFS_PASSWORD]}"
+      }
     }
-  ],
-  "tls": {
-    "enabled": true,
-    "server_name": "${VARS[SNI]}",
-    "alpn": ["h3"],
-    "min_version": "1.2",
-    "max_version": "1.3",
-    "cipher_suites": "TLS_CHACHA20_POLY1305_SHA256"
-  },
-  "masquerade": "https://${VARS[SNI]}",
-  "obfs": {
-    "type": "salamander",
-    "password": "${VARS[HY2_OBFS_PASSWORD]}"
-  }
-},
   ],
   "outbounds": [
     {
@@ -567,15 +608,14 @@ generate_links() {
     echo "$reality_link"
     echo ""
     
-    # Hysteria2 链接
-    local hy2_link="hysteria2://${VARS[HY2_PASSWORD]}@${server_ip}:${VARS[HY2_PORT]}?sni=${VARS[SNI]}&alpn=h3&obfs=salamander&obfs-password=${VARS[HY2_OBFS_PASSWORD]}&hop-interval=10s&mport=${VARS[HY2_HOP_START]}%2C${VARS[HY2_HOP_END]}#Hysteria2-${server_ip}"
+    # Hysteria2 链接 (含随机跳跃间隔参数)
+    local hy2_link="hysteria2://${VARS[HY2_PASSWORD]}@${server_ip}:${VARS[HY2_PORT]}?sni=${VARS[SNI]}&alpn=h3&obfs=salamander&obfs-password=${VARS[HY2_OBFS_PASSWORD]}&min-hop-interval=${VARS[HY2_MIN_HOP_INTERVAL]}&max-hop-interval=${VARS[HY2_MAX_HOP_INTERVAL]}&mport=${VARS[HY2_HOP_START]}%2C${VARS[HY2_HOP_END]}#Hysteria2-${server_ip}"
     
     echo -e "${GREEN}═══ Hysteria2 节点 ═══${NC}"
     echo -e "${YELLOW}链接:${NC}"
     echo "$hy2_link"
     echo ""
     
-    # 保存链接到文件
     cat > "${SINGBOX_DIR}/links.txt" << EOF
 Reality 节点:
 ${reality_link}
@@ -592,26 +632,21 @@ EOF
 configure_firewall() {
     log INFO "配置防火墙规则..."
     
-    # Reality 端口
     if [[ -n "${VARS[REALITY_PORT]}" ]]; then
         ufw allow "${VARS[REALITY_PORT]}/tcp" comment "Reality" >> "$LOG_FILE" 2>&1
         log INFO "放行 Reality 端口: ${VARS[REALITY_PORT]}/tcp"
     fi
     
-    # Hysteria2 主端口
     if [[ -n "${VARS[HY2_PORT]}" ]]; then
         ufw allow "${VARS[HY2_PORT]}/udp" comment "Hysteria2" >> "$LOG_FILE" 2>&1
         log INFO "放行 Hysteria2 主端口: ${VARS[HY2_PORT]}/udp"
     fi
     
-    # 端口跳跃范围
     if [[ -n "${VARS[HY2_HOP_START]}" ]] && [[ -n "${VARS[HY2_HOP_END]}" ]]; then
-        # 使用 ufw 放行端口范围
         ufw allow "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}/udp" comment "Hysteria2 Hop" >> "$LOG_FILE" 2>&1
         log INFO "放行 Hysteria2 跳跃端口范围: ${VARS[HY2_HOP_START]}-${VARS[HY2_HOP_END]}/udp"
     fi
     
-    # 启用 UFW (如果未启用)
     if ! ufw status | grep -q "Status: active"; then
         echo "y" | ufw enable >> "$LOG_FILE" 2>&1
         log INFO "UFW 防火墙已启用"
@@ -624,15 +659,12 @@ configure_firewall() {
 setup_nat_forwarding() {
     log INFO "配置 NAT 端口转发 (端口跳跃)..."
     
-    # 清除旧的转发规则
-    iptables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null
-    ip6tables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null || true
     
-    # 添加新的转发规则
     iptables -t nat -A PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}"
     ip6tables -t nat -A PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}"
     
-    # 持久化规则
     if command -v netfilter-persistent &>/dev/null; then
         netfilter-persistent save >> "$LOG_FILE" 2>&1
     else
@@ -664,57 +696,7 @@ EOF
     sysctl -p /etc/sysctl.d/99-singbox.conf >> "$LOG_FILE" 2>&1
     log INFO "系统参数优化完成"
 }
-#--------------------------- 配置保活参数 ---------------------------#
-configure_keepalive() {
-    log INFO "配置保活参数..."
-    
-    echo ""
-    echo -e "${CYAN}========== 保活配置 ==========${NC}"
-    echo -e "${YELLOW}保活功能可防止长时间无流量时连接被运营商/QoS中断${NC}"
-    echo ""
-    
-    # Reality TCP 保活
-    if [[ -z "${VARS[TCP_KEEPALIVE_INTERVAL]}" ]]; then
-        read -p "TCP 保活间隔(秒, 默认30): " input_interval
-        VARS[TCP_KEEPALIVE_INTERVAL]="${input_interval:-30}"
-    else
-        echo -e "当前 TCP 保活间隔: ${GREEN}${VARS[TCP_KEEPALIVE_INTERVAL]}秒${NC}"
-        read -p "是否修改? [y/N]: " -r
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            read -p "TCP 保活间隔(秒, 默认30): " input_interval
-            VARS[TCP_KEEPALIVE_INTERVAL]="${input_interval:-30}"
-        fi
-    fi
-    
-    # Hysteria2 心跳
-    if [[ -z "${VARS[HY2_HEARTBEAT]}" ]]; then
-        read -p "Hysteria2 心跳间隔(秒, 默认10s): " input_hb
-        VARS[HY2_HEARTBEAT]="${input_hb:-10s}"
-    else
-        echo -e "当前 Hysteria2 心跳间隔: ${GREEN}${VARS[HY2_HEARTBEAT]}${NC}"
-        read -p "是否修改? [y/N]: " -r
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            read -p "Hysteria2 心跳间隔(秒, 默认10s): " input_hb
-            VARS[HY2_HEARTBEAT]="${input_hb:-10s}"
-        fi
-    fi
-    
-    # Hysteria2 空闲超时（设为0则不超时）
-    if [[ -z "${VARS[HY2_IDLE_TIMEOUT]}" ]]; then
-        read -p "Hysteria2 空闲超时(秒, 0=不超时, 默认0): " input_idle
-        VARS[HY2_IDLE_TIMEOUT]="${input_idle:-0}"
-    else
-        echo -e "当前 Hysteria2 空闲超时: ${GREEN}${VARS[HY2_IDLE_TIMEOUT]}秒${NC}"
-        read -p "是否修改? [y/N]: " -r
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            read -p "Hysteria2 空闲超时(秒, 0=不超时, 默认0): " input_idle
-            VARS[HY2_IDLE_TIMEOUT]="${input_idle:-0}"
-        fi
-    fi
-    
-    save_vars
-    echo -e "${GREEN}✓ 保活配置完成${NC}"
-}
+
 #--------------------------- 启动服务 ---------------------------#
 start_service() {
     log INFO "启动 Sing-Box 服务..."
@@ -739,14 +721,12 @@ check_status() {
     echo -e "${CYAN}║          服务状态检查                    ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     
-    # Sing-Box 状态
     if systemctl is-active --quiet sing-box; then
         echo -e "Sing-Box:    ${GREEN}运行中${NC}"
     else
         echo -e "Sing-Box:    ${RED}未运行${NC}"
     fi
     
-    # 端口监听
     echo ""
     echo -e "${YELLOW}端口监听状态:${NC}"
     if [[ -n "${VARS[REALITY_PORT]}" ]]; then
@@ -765,7 +745,6 @@ check_status() {
         fi
     fi
     
-    # 防火墙
     echo ""
     echo -e "${YELLOW}UFW 状态:${NC}"
     ufw status verbose | grep -E "^${VARS[REALITY_PORT]}|^${VARS[HY2_PORT]}|${VARS[HY2_HOP_START]}" 2>/dev/null || echo "  (未找到相关规则)"
@@ -788,31 +767,33 @@ modify_config() {
         echo -e "  Hysteria2 密码:    ${GREEN}${VARS[HY2_PASSWORD]:-未设置}${NC}"
         echo -e "  Hysteria2 端口:    ${GREEN}${VARS[HY2_PORT]:-未设置}${NC}"
         echo -e "  跳跃端口范围:      ${GREEN}${VARS[HY2_HOP_START]:-未设置}-${VARS[HY2_HOP_END]:-未设置}${NC}"
+        echo -e "  随机跳跃间隔:      ${GREEN}${VARS[HY2_MIN_HOP_INTERVAL]:-未设置} ~ ${VARS[HY2_MAX_HOP_INTERVAL]:-未设置}${NC}"
         echo -e "  混淆密码:          ${GREEN}${VARS[HY2_OBFS_PASSWORD]:-未设置}${NC}"
+        echo -e "  TCP保活间隔:       ${GREEN}${VARS[TCP_KEEPALIVE_INTERVAL]:-未设置}秒${NC}"
+        echo -e "  HY2心跳间隔:       ${GREEN}${VARS[HY2_HEARTBEAT]:-未设置}${NC}"
+        echo -e "  HY2空闲超时:       ${GREEN}${VARS[HY2_IDLE_TIMEOUT]:-未设置}秒${NC}"
         echo ""
         echo "1. 修改 Reality 配置"
         echo "2. 修改 Hysteria2 配置"
-        echo "3. 重新生成所有配置"
-        echo "4. 重新部署服务"
-        echo "5. 返回主菜单"
+        echo "3. 修改保活参数"
+        echo "4. 重新生成所有配置"
+        echo "5. 重新部署服务"
+        echo "6. 返回主菜单"
         echo ""
-        read -p "请选择 [1-5]: " choice
+        read -p "请选择 [1-6]: " choice
         
         case $choice in
-            1)
-                configure_reality
-                ;;
-            2)
-                configure_hysteria2
-                ;;
-            3)
+            1) configure_reality ;;
+            2) configure_hysteria2 ;;
+            3) configure_keepalive ;;
+            4)
                 generate_singbox_config
                 generate_links
                 configure_firewall
                 setup_nat_forwarding
                 log INFO "配置已重新生成"
                 ;;
-            4)
+            5)
                 generate_singbox_config
                 generate_links
                 configure_firewall
@@ -821,12 +802,8 @@ modify_config() {
                 start_service
                 log INFO "服务已重新部署"
                 ;;
-            5)
-                return
-                ;;
-            *)
-                log ERROR "无效选择"
-                ;;
+            6) return ;;
+            *) log ERROR "无效选择" ;;
         esac
     done
 }
@@ -844,15 +821,12 @@ uninstall() {
     
     log WARN "开始卸载..."
     
-    # 停止服务
-    systemctl stop sing-box 2>/dev/null
-    systemctl disable sing-box 2>/dev/null
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl disable sing-box 2>/dev/null || true
     
-    # 清除 NAT 规则
-    iptables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null
-    ip6tables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -p udp --dport "${VARS[HY2_HOP_START]}:${VARS[HY2_HOP_END]}" -j REDIRECT --to-port "${VARS[HY2_PORT]}" 2>/dev/null || true
     
-    # 删除文件
     rm -rf "$SINGBOX_DIR" 2>/dev/null
     rm -f "$SINGBOX_BIN" 2>/dev/null
     rm -f /etc/apt/sources.list.d/sing-box.list 2>/dev/null
@@ -868,7 +842,7 @@ main_menu() {
         echo ""
         echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}║   Reality + Hysteria2 安全部署脚本      ║${NC}"
-        echo -e "${CYAN}║         Sing-Box 内核                   ║${NC}"
+        echo -e "${CYAN}║         Sing-Box 内核 v2.0              ║${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
         echo ""
         echo "1. 完整部署 (交互式配置 + 安装 + 启动)"
@@ -889,6 +863,7 @@ main_menu() {
                 install_singbox
                 configure_reality
                 configure_hysteria2
+                configure_keepalive
                 generate_singbox_config
                 generate_links
                 configure_firewall
@@ -910,25 +885,20 @@ main_menu() {
                 load_vars
                 configure_reality
                 configure_hysteria2
+                configure_keepalive
                 generate_singbox_config
                 generate_links
                 configure_firewall
                 setup_nat_forwarding
                 start_service
                 ;;
-            3)
-                modify_config
-                ;;
+            3) modify_config ;;
             4)
                 load_vars
                 generate_links
                 ;;
-            5)
-                check_status
-                ;;
-            6)
-                start_service
-                ;;
+            5) check_status ;;
+            6) start_service ;;
             7)
                 systemctl stop sing-box
                 log INFO "Sing-Box 服务已停止"
@@ -941,9 +911,7 @@ main_menu() {
                 echo "再见！"
                 exit 0
                 ;;
-            *)
-                log ERROR "无效选择，请重试"
-                ;;
+            *) log ERROR "无效选择，请重试" ;;
         esac
     done
 }
