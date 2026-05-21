@@ -109,6 +109,9 @@ load_vars() {
     if [[ -f "$VARS_FILE" ]]; then
         source "$VARS_FILE"
         # 将保存的变量加载到数组
+        VARS[TCP_KEEPALIVE_INTERVAL]="${TCP_KEEPALIVE_INTERVAL:-30}"
+        VARS[HY2_HEARTBEAT]="${HY2_HEARTBEAT:-10s}"
+        VARS[HY2_IDLE_TIMEOUT]="${HY2_IDLE_TIMEOUT:-0}"
         VARS[REALITY_UUID]="${REALITY_UUID:-}"
         VARS[REALITY_PORT]="${REALITY_PORT:-}"
         VARS[REALITY_SERVER_NAME]="${REALITY_SERVER_NAME:-}"
@@ -127,6 +130,9 @@ load_vars() {
 
 #--------------------------- 保存变量 ---------------------------#
 save_vars() {
+TCP_KEEPALIVE_INTERVAL="${VARS[TCP_KEEPALIVE_INTERVAL]}"
+HY2_HEARTBEAT="${VARS[HY2_HEARTBEAT]}"
+HY2_IDLE_TIMEOUT="${VARS[HY2_IDLE_TIMEOUT]}"
     cat > "$VARS_FILE" << EOF
 REALITY_UUID="${VARS[REALITY_UUID]}"
 REALITY_PORT="${VARS[REALITY_PORT]}"
@@ -454,60 +460,68 @@ generate_singbox_config() {
   },
   "inbounds": [
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": ${VARS[REALITY_PORT]},
-      "sniff": true,
-      "sniff_override_destination": false,
-      "users": [
-        {
-          "uuid": "${VARS[REALITY_UUID]}",
-          "flow": ""
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${VARS[REALITY_SERVER_NAME]}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${VARS[REALITY_DEST]}",
-            "server_port": 443
-          },
-          "private_key": "${VARS[REALITY_PRIVATE_KEY]}",
-          "short_id": ["${VARS[REALITY_SHORT_ID]}"]
-        }
-      }
-    },
+  "type": "vless",
+  "tag": "vless-in",
+  "listen": "::",
+  "listen_port": ${VARS[REALITY_PORT]},
+  "sniff": true,
+  "sniff_override_destination": false,
+  "users": [
     {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": ${VARS[HY2_PORT]},
-      "sniff": true,
-      "sniff_override_destination": false,
-      "up_mbps": 1000,
-      "down_mbps": 1000,
-      "users": [
-        {
-          "password": "${VARS[HY2_PASSWORD]}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${VARS[SNI]}",
-        "alpn": ["h3"],
-        "min_version": "1.2",
-        "max_version": "1.3",
-        "cipher_suites": "TLS_CHACHA20_POLY1305_SHA256"
-      },
-      "masquerade": "https://${VARS[SNI]}",
-      "obfs": {
-        "type": "salamander",
-        "password": "${VARS[HY2_OBFS_PASSWORD]}"
-      }
+      "uuid": "${VARS[REALITY_UUID]}",
+      "flow": ""
     }
+  ],
+  "tls": {
+    "enabled": true,
+    "server_name": "${VARS[REALITY_SERVER_NAME]}",
+    "reality": {
+      "enabled": true,
+      "handshake": {
+        "server": "${VARS[REALITY_DEST]}",
+        "server_port": 443
+      },
+      "private_key": "${VARS[REALITY_PRIVATE_KEY]}",
+      "short_id": ["${VARS[REALITY_SHORT_ID]}"]
+    }
+  },
+  "transport": {
+    "type": "tcp",
+    "tcp": {
+      "keepalive_interval": ${VARS[TCP_KEEPALIVE_INTERVAL]}
+    }
+  }
+},
+    {
+  "type": "hysteria2",
+  "tag": "hy2-in",
+  "listen": "::",
+  "listen_port": ${VARS[HY2_PORT]},
+  "sniff": true,
+  "sniff_override_destination": false,
+  "up_mbps": 1000,
+  "down_mbps": 1000,
+  "idle_timeout": "${VARS[HY2_IDLE_TIMEOUT]}s",
+  "heartbeat": "${VARS[HY2_HEARTBEAT]}",
+  "users": [
+    {
+      "password": "${VARS[HY2_PASSWORD]}"
+    }
+  ],
+  "tls": {
+    "enabled": true,
+    "server_name": "${VARS[SNI]}",
+    "alpn": ["h3"],
+    "min_version": "1.2",
+    "max_version": "1.3",
+    "cipher_suites": "TLS_CHACHA20_POLY1305_SHA256"
+  },
+  "masquerade": "https://${VARS[SNI]}",
+  "obfs": {
+    "type": "salamander",
+    "password": "${VARS[HY2_OBFS_PASSWORD]}"
+  }
+},
   ],
   "outbounds": [
     {
@@ -650,7 +664,57 @@ EOF
     sysctl -p /etc/sysctl.d/99-singbox.conf >> "$LOG_FILE" 2>&1
     log INFO "系统参数优化完成"
 }
-
+#--------------------------- 配置保活参数 ---------------------------#
+configure_keepalive() {
+    log INFO "配置保活参数..."
+    
+    echo ""
+    echo -e "${CYAN}========== 保活配置 ==========${NC}"
+    echo -e "${YELLOW}保活功能可防止长时间无流量时连接被运营商/QoS中断${NC}"
+    echo ""
+    
+    # Reality TCP 保活
+    if [[ -z "${VARS[TCP_KEEPALIVE_INTERVAL]}" ]]; then
+        read -p "TCP 保活间隔(秒, 默认30): " input_interval
+        VARS[TCP_KEEPALIVE_INTERVAL]="${input_interval:-30}"
+    else
+        echo -e "当前 TCP 保活间隔: ${GREEN}${VARS[TCP_KEEPALIVE_INTERVAL]}秒${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "TCP 保活间隔(秒, 默认30): " input_interval
+            VARS[TCP_KEEPALIVE_INTERVAL]="${input_interval:-30}"
+        fi
+    fi
+    
+    # Hysteria2 心跳
+    if [[ -z "${VARS[HY2_HEARTBEAT]}" ]]; then
+        read -p "Hysteria2 心跳间隔(秒, 默认10s): " input_hb
+        VARS[HY2_HEARTBEAT]="${input_hb:-10s}"
+    else
+        echo -e "当前 Hysteria2 心跳间隔: ${GREEN}${VARS[HY2_HEARTBEAT]}${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "Hysteria2 心跳间隔(秒, 默认10s): " input_hb
+            VARS[HY2_HEARTBEAT]="${input_hb:-10s}"
+        fi
+    fi
+    
+    # Hysteria2 空闲超时（设为0则不超时）
+    if [[ -z "${VARS[HY2_IDLE_TIMEOUT]}" ]]; then
+        read -p "Hysteria2 空闲超时(秒, 0=不超时, 默认0): " input_idle
+        VARS[HY2_IDLE_TIMEOUT]="${input_idle:-0}"
+    else
+        echo -e "当前 Hysteria2 空闲超时: ${GREEN}${VARS[HY2_IDLE_TIMEOUT]}秒${NC}"
+        read -p "是否修改? [y/N]: " -r
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "Hysteria2 空闲超时(秒, 0=不超时, 默认0): " input_idle
+            VARS[HY2_IDLE_TIMEOUT]="${input_idle:-0}"
+        fi
+    fi
+    
+    save_vars
+    echo -e "${GREEN}✓ 保活配置完成${NC}"
+}
 #--------------------------- 启动服务 ---------------------------#
 start_service() {
     log INFO "启动 Sing-Box 服务..."
